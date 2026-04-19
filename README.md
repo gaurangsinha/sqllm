@@ -145,3 +145,8 @@ The default SQLite page size is 4KB or 8KB. By building the database with  (the 
 ### Option B: Custom C Extension (Tested, Reverted)
 We wrote a custom SQLite loadable C extension (`dot_product.dylib`) to replace `SUM(n.val * w.val)` with a tight C accumulation loop vectorized by compiler AVX2/FMA intrinsics.
 **Result:** Performance *regressed* from 135s to 138s per token. In SQLite, the overhead of the Virtual DataBase Engine (VDBE) dispatching a User-Defined Function (UDF) pointer on every row is higher than the inline bytecode execution of the built-in `SUM`, even when the built-in function is doing Kahan compensation. We reverted the change.
+
+
+### Option C: INT8 Quantization (Tested, Reverted)
+We implemented symmetric abs-max INT8 quantization on the weight matrices during `load_model.py` to shrink the database from 28GB to 20GB and reduce the size of the covering index, aiming for massive I/O savings.
+**Result:** Performance *regressed* from 135s to 189s per token. Because we compile SQLite to heavily use memory-mapped I/O (`mmap`) and 256MB page caching, the disk I/O savings afforded by INT8 were marginal. Conversely, adding inner-loop dequantization arithmetic `(w.val * s.scale)` inside the VDBE blew up the pure CPU compute time. We reverted the change.
