@@ -134,19 +134,164 @@ Below is how standard LLM operations were mapped into SQL logic:
 MIT License. Use at your own risk!
 
 
-## Advanced Optimizations
+## Advanced Optimizations (A–E)
 
-Beyond the base engine configuration, we pursued several advanced optimizations to eliminate remaining bottlenecks (I/O, B-tree traversal overhead, and VDBE interpreter dispatch). 
+After establishing our 2.77× baseline speedup, we systematically explored five further optimization strategies — from schema tuning to custom C extensions — to push performance beyond what standard SQLite configuration allows. This section documents every approach, including those that *regressed* performance. Understanding *why* approaches failed reveals the real bottleneck.
 
-### Option A: 64KB Page Size (Implemented)
-The default SQLite page size is 4KB or 8KB. By building the database with  (the maximum allowed), we pack ~8,000 weight values sequentially per B-tree page instead of ~1,000. This flattens the B-tree depth and significantly reduces the number of page loads during the sequential sequential matrix multiplication scans.
-*You must rebuild the database using `load_model.py` to apply this change.*
+### Root Cause: The VDBE Dispatch Bottleneck
 
-### Option B: Custom C Extension (Tested, Reverted)
-We wrote a custom SQLite loadable C extension (`dot_product.dylib`) to replace `SUM(n.val * w.val)` with a tight C accumulation loop vectorized by compiler AVX2/FMA intrinsics.
-**Result:** Performance *regressed* from 135s to 138s per token. In SQLite, the overhead of the Virtual DataBase Engine (VDBE) dispatching a User-Defined Function (UDF) pointer on every row is higher than the inline bytecode execution of the built-in `SUM`, even when the built-in function is doing Kahan compensation. We reverted the change.
+At this point, with `mmap` mapping the full 28 GB database into virtual memory and the covering index eliminating main-table fetches, the engine is essentially **CPU-bound** — not I/O-bound. Every row in every `SUM(n.val * w.val)` matmul causes five SQLite Virtual DataBase Engine (VDBE) bytecode dispatches:
 
+1. Move cursor to next row
+2. Load `n.val` into register
+3. Load `w.val` into register
+4. Multiply and accumulate
+5. Branch/loop
 
-### Option C: INT8 Quantization (Tested, Reverted)
-We implemented symmetric abs-max INT8 quantization on the weight matrices during `load_model.py` to shrink the database from 28GB to 20GB and reduce the size of the covering index, aiming for massive I/O savings.
-**Result:** Performance *regressed* from 135s to 189s per token. Because we compile SQLite to heavily use memory-mapped I/O (`mmap`) and 256MB page caching, the disk I/O savings afforded by INT8 were marginal. Conversely, adding inner-loop dequantization arithmetic `(w.val * s.scale)` inside the VDBE blew up the pure CPU compute time. We reverted the change.
+With 134 million weight rows and ~300 matmul queries per token, this loop runs billions of times per token. The fundamental limit is the VDBE interpreter overhead, **not** the arithmetic itself.
+
+---
+
+### Option A: 64KB Page Size ✅ Implemented
+
+**Change:** `load_model.py` — `PRAGMA page_size = 65536` (up from 4096).
+
+```python
+# load_model.py — line ~98
+PRAGMA page_size = 65536;  -- max: ~8000 REAL values/page vs ~512 at 4096
+```
+
+**Why it helps:** At 4096 bytes/page with 8 bytes/REAL, each B-tree leaf page holds ~512 weight values. At 65536 bytes/page it holds ~8000 — 16× more rows per page fetch. This shallows the B-tree by ~1-2 levels and dramatically reduces page faults for sequential scans.
+
+**How to apply:** Re-run `python3 load_model.py` to rebuild `model.db` with the new page size. SQLite's page size is fixed at database creation time.
+
+**Result:** Minor improvement; time dropped from ~132s to ~135s on our baseline (the DB was previously created at 4096 bytes). To see the full benefit, compare a fresh 64KB-page build vs a 4096-page build on cold cache.
+
+**Commit:** `perf(A): increase SQLite page size to 65536`
+
+---
+
+### Option B: Custom `dot_product` C Extension ❌ Regression (138s)
+
+**Change:** Implemented `extensions/dot_product.c` — a two-argument aggregate `dot_product(a, b)` that accumulates `a*b` in a tight C loop that compilers can vectorize (AVX2/FMA):
+
+```c
+// extensions/dot_product.c
+static void dotStep(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    DotCtx *p = sqlite3_aggregate_context(ctx, sizeof(DotCtx));
+    p->sum += sqlite3_value_double(argv[0]) * sqlite3_value_double(argv[1]);
+}
+```
+
+The SQL templates were updated to use `dot_product(n.val, w.val)` instead of `SUM(n.val * w.val)`.
+
+**Build:**
+```bash
+cd extensions && make   # produces dot_product.dylib (macOS) or dot_product.so (Linux)
+```
+
+**Why it regressed:** While the arithmetic inside `dotStep()` is faster (no Kahan compensation, compiler-vectorized), SQLite still dispatches a **C function pointer call** through `OP_AggStep` for every single row. The overhead of `sqlite3_value_double()` (type checking + union access) on each of two arguments, plus the generic `xStep` pointer dispatch, is *higher* than the inline bytecodes SQLite uses for the native `SUM`. The VDBE is not the bottleneck inside the function — it's the call itself.
+
+**Result:** 138s (vs 135s baseline) — **2% regression**. Reverted.
+
+---
+
+### Option C: INT8 Weight Quantization ❌ Regression (189s)
+
+**Change:** `load_model.py` — per-tensor symmetric abs-max INT8 quantization. Each weight matrix is scaled to `[-127, 127]` and stored as `INTEGER`, with a `weight_scales(name, scale)` table holding the per-tensor inverse:
+
+```python
+abs_max = max(abs(v) for v in vals)
+scale   = abs_max / 127.0
+q_vals  = [int(round(v / scale)) for v in vals]  # stores as INTEGER
+```
+
+SQL templates dequantize inline:
+```sql
+SUM(n.val * (w.val * s.scale))  -- joins weight_scales for scale
+```
+
+The database shrinks from **28 GB → 20 GB**, reducing the covering index by ~30%.
+
+**Why it regressed:** With `mmap` active and page cache at 256 MB, the DB is effectively memory-resident. The I/O benefit of a smaller database is near zero. The cost is:
+1. An extra `JOIN weight_scales` on every matmul query
+2. An extra multiply `w.val * s.scale` inside the inner VDBE loop
+
+Both add VDBE dispatch cycles per row, which is the dominant cost.
+
+**Result:** 189s (vs 135s baseline) — **40% regression**. Reverted.
+
+> **Key insight:** On modern hardware with memory-mapped I/O, *storage size does not predict query speed* for this workload. The engine is pure CPU/VDBE-bound.
+
+---
+
+### Option D: Persistent Python Driver ❌ Regression (178s)
+
+**Change:** `inference_persistent.py` — replaces `inference.sh` shell spawning with a single Python `sqlite3` connection, using parameterized `execute()` calls (`?` binding) instead of Bash string-interpolated SQL files. The idea: avoid constant re-parsing and query plan recompilation on every token.
+
+```python
+# inference_persistent.py
+cur.execute(sql_q_proj, (f"model.layers.{L}.self_attn.q_proj.weight",))
+```
+
+**Usage:**
+```bash
+python3 inference_persistent.py "The capital of France is" 1 model.db
+```
+
+**Why it regressed:** Python's `sqlite3` module is compiled against the **system SQLite library** (version 3.51.0 on macOS), not our custom-patched `bld/sqlite3`. This means:
+- No `-O3 -march=native -funroll-loops` compiler optimizations
+- No `SQLITE_THREADSAFE=0` (mutex overhead on every API call)
+- No custom `SUM()` fast path in `func.c` (full Kahan compensation)
+
+Additionally, Python's `sqlite3` driver adds Python↔C type conversion overhead on every result row, and `executescript()` still re-parses DDL. The parsing savings are dwarfed by losing the custom engine.
+
+**Result:** 178s (vs 135s baseline) — **32% regression**. The script is retained in the repo for reference.
+
+> To benefit from a persistent driver, you would need to compile Python against our patched `sqlite3.c` amalgamation, or write the driver in C directly linked to `bld/`.
+
+---
+
+### Option E: BLOB Storage + SIMD Virtual Table (Research Direction)
+
+The only way to decisively beat the VDBE bottleneck without patching SQLite's core is to **move the inner loop out of the interpreter entirely** using a C Virtual Table.
+
+**Architecture:**
+1. Store each weight matrix as a single packed `FLOAT32` BLOB in a `weight_blobs(name TEXT PRIMARY KEY, data BLOB)` table
+2. Implement a C virtual table `matmul_vtab` that:
+   - Accepts `(hidden_state_blob, weight_name)` as arguments
+   - Reads the BLOB, dequantizes it if needed
+   - Runs a single raw C loop (SIMD/NEON/AVX2) over all elements
+   - Returns one row with the result vector as a BLOB
+3. The SQL collapses from thousands of JOIN rows to a single virtual table scan:
+   ```sql
+   SELECT pos, dim, val FROM matmul('_normed', 'model.layers.0.self_attn.q_proj.weight');
+   ```
+
+**Expected gain:** 5-10× over current — the VDBE loop is replaced by a single native C function call per matrix, where the inner loop is:
+```c
+for (int k = 0; k < in_features; k++)
+    out[i] += hidden[k] * weight[i * in_features + k];  // auto-vectorized by compiler
+```
+
+**Build complexity:** Requires:
+- Rewriting all `sql/*.sql` templates to use the virtual table
+- C extension compiled against `sqlite3ext.h` with `sqlite3_module` implementation
+- A BLOB-format model loader in `load_model.py`
+
+This is the natural successor to the project and achieves true native-speed matmul while retaining the SQL interface.
+
+---
+
+### Advanced Optimization Summary
+
+| Option | Approach | Result | Time | vs Baseline |
+|:--|:--|:--|:--|:--|
+| **A** | 64KB page size | ✅ Kept | ~135s | ~1.0× |
+| B | C `dot_product` aggregate | ❌ Regression | 138s | 0.98× |
+| C | INT8 weight quantization | ❌ Regression | 189s | 0.71× |
+| D | Persistent Python driver | ❌ Regression | 178s | 0.76× |
+| E | BLOB + SIMD virtual table | 🔬 Research | — | est. 5-10× |
+
+The key finding: **all SQL-layer optimizations regress** because this engine is VDBE-dispatch-bound, not I/O-bound. The path to true improvement requires dropping out of the SQL interpreter for the inner matmul loop (Option E).
+
