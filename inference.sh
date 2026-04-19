@@ -3,10 +3,14 @@
 # Orchestrates SmolLM-135M using pure SQL for the forward pass
 
 # Fetch prompt configs from CLI args; defaults to basic inference
-prompt="${1:-The capital of France is }"
+prompt="${1:-The capital of France is}"
 max_new_tokens="${2:-1}"
 # Allows hot-swapping DB targets (like model_cover.db mapping Covered Indexes)
 db_file="${3:-model.db}"
+# 4th arg: path to sqlite3 binary (default: sqlite3 from PATH).
+# Use this to compare stock vs optimised builds:
+#   bash inference.sh "The capital of France is" 1 model.db /path/to/optimised/sqlite3
+SQLITE_BIN="${4:-sqlite3}"
 
 if [[ ! -f "$db_file" ]]; then
     echo "Error: $db_file not found. Run load_model.py first."
@@ -110,7 +114,7 @@ for ((i=0; i<$max_new_tokens; i++)); do
     build_sql_script "$tokens" > "$script_file"
 
     # Triggers absolute SQLite engine passing parameters and capturing the exact final prediction. `tail` parses native SQL output!
-    next_token=$(sqlite3 $SQLITE_EXTRA_ARGS "$db_file" < "$script_file" | tail -n 1)
+    next_token=$("$SQLITE_BIN" $SQLITE_EXTRA_ARGS "$db_file" < "$script_file" | tail -n 1)
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
