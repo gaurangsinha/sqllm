@@ -95,7 +95,7 @@ def main():
     cur.executescript("""
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
-        PRAGMA page_size    = 8192;
+        PRAGMA page_size    = 65536;  -- max page size: ~8000 REAL values/page vs ~1000 at 8192
         PRAGMA cache_size   = -2000000;
 
         CREATE TABLE weights (

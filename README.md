@@ -132,3 +132,16 @@ Below is how standard LLM operations were mapped into SQL logic:
 
 ## License
 MIT License. Use at your own risk!
+
+
+## Advanced Optimizations
+
+Beyond the base engine configuration, we pursued several advanced optimizations to eliminate remaining bottlenecks (I/O, B-tree traversal overhead, and VDBE interpreter dispatch). 
+
+### Option A: 64KB Page Size (Implemented)
+The default SQLite page size is 4KB or 8KB. By building the database with  (the maximum allowed), we pack ~8,000 weight values sequentially per B-tree page instead of ~1,000. This flattens the B-tree depth and significantly reduces the number of page loads during the sequential sequential matrix multiplication scans.
+*You must rebuild the database using `load_model.py` to apply this change.*
+
+### Option B: Custom C Extension (Tested, Reverted)
+We wrote a custom SQLite loadable C extension (`dot_product.dylib`) to replace `SUM(n.val * w.val)` with a tight C accumulation loop vectorized by compiler AVX2/FMA intrinsics.
+**Result:** Performance *regressed* from 135s to 138s per token. In SQLite, the overhead of the Virtual DataBase Engine (VDBE) dispatching a User-Defined Function (UDF) pointer on every row is higher than the inline bytecode execution of the built-in `SUM`, even when the built-in function is doing Kahan compensation. We reverted the change.
