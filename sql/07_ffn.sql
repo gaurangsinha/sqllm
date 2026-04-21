@@ -7,22 +7,12 @@
 -- 1. Compute gate_proj into _gate
 DELETE FROM _gate;
 INSERT INTO _gate(pos, dim, val)
-SELECT n.pos,
-       w.i0 AS dim,
-       SUM(n.val * w.val) AS val
-FROM _normed n
-JOIN weights w ON w.name = '{L_GATE}' AND w.i1 = n.dim
-GROUP BY n.pos, w.i0;
+SELECT pos, dim, val FROM matmul('_normed', '{L_GATE}');
 
 -- 2. Compute up_proj into _up
 DELETE FROM _up;
 INSERT INTO _up(pos, dim, val)
-SELECT n.pos,
-       w.i0 AS dim,
-       SUM(n.val * w.val) AS val
-FROM _normed n
-JOIN weights w ON w.name = '{L_UP}' AND w.i1 = n.dim
-GROUP BY n.pos, w.i0;
+SELECT pos, dim, val FROM matmul('_normed', '{L_UP}');
 
 -- 3. SwiGLU activation and element-wise multiply
 -- ffn_mid = gate * (gate / (1 + exp(-gate))) * up

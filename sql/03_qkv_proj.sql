@@ -10,11 +10,7 @@
 DELETE FROM {TGT};
 
 INSERT INTO {TGT}(pos, dim, val)
-SELECT n.pos,
-       w.i0   AS dim,
-       SUM(n.val * w.val) AS val
-FROM   _normed n
-JOIN   weights w
-          ON  w.name = '{W}'
-          AND w.i1   = n.dim
-GROUP  BY n.pos, w.i0;
+SELECT pos,
+       dim,
+       val
+FROM   matmul('_normed', '{W}');

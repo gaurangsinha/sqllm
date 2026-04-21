@@ -14,14 +14,7 @@ CREATE TEMP TABLE IF NOT EXISTS _proj_tmp (
 DELETE FROM _proj_tmp;
 
 INSERT INTO _proj_tmp(pos, dim, val)
-SELECT t.pos,
-       w.i0,
-       SUM(t.val * w.val)
-FROM {TGT} t
-JOIN weights w
-  ON w.name = '{W}'
-  AND w.i1 = t.dim
-GROUP BY t.pos, w.i0;
+SELECT pos, dim, val FROM matmul('{TGT}', '{W}');
 
 -- Now add to residual (_hidden)
 -- SQLite doesn't have an easy UPDATE ... FROM for this specific aggregation pattern

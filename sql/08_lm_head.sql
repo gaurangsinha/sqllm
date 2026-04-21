@@ -4,15 +4,14 @@
 
 DELETE FROM _logits;
 
--- Only look at the final token's hidden state
+CREATE TEMP TABLE IF NOT EXISTS _normed_last (pos INTEGER, dim INTEGER, val REAL);
+DELETE FROM _normed_last;
+INSERT INTO _normed_last(pos, dim, val) 
+SELECT 0, dim, val FROM _normed WHERE pos = {LAST_POS};
+
 INSERT INTO _logits(token_id, score)
-SELECT
-    w.i0 AS token_id,
-    SUM(n.val * w.val) AS score
-FROM _normed n
-JOIN weights w ON w.name = 'model.embed_tokens.weight' AND w.i1 = n.dim
-WHERE n.pos = {LAST_POS}
-GROUP BY w.i0;
+SELECT dim AS token_id, val AS score
+FROM matmul('_normed_last', 'model.embed_tokens.weight');
 
 -- Return the sampled token ID
 SELECT token_id FROM _logits ORDER BY score DESC LIMIT 1;

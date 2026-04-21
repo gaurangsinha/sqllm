@@ -105,6 +105,13 @@ def main():
             val  REAL    NOT NULL
         );
 
+        CREATE TABLE weight_blobs (
+            name TEXT PRIMARY KEY,
+            in_features INTEGER,
+            out_features INTEGER,
+            data BLOB
+        );
+
         CREATE TABLE model_config (
             key   TEXT PRIMARY KEY,
             value TEXT
@@ -138,6 +145,13 @@ def main():
             shape = info["shape"]
             rows  = rows_from(name, shape, vals)
             insert_batch(cur, rows)
+
+            in_features = shape[1] if len(shape) > 1 else 1
+            out_features = shape[0]
+            blob_data = struct.pack(f"<{len(vals)}f", *vals)
+            cur.execute("INSERT INTO weight_blobs(name, in_features, out_features, data) VALUES(?,?,?,?)",
+                        (name, in_features, out_features, sqlite3.Binary(blob_data)))
+
             conn.commit()
             elapsed = time.time() - t0
             print(f"  [{idx:3d}/{N}] {name:60s} shape={str(shape):20s}  "

@@ -31,6 +31,8 @@ build_sql_script() {
     # Positions are 0-indexed across relational SQL tables
     local last_pos=$((num_tokens - 1))
 
+    echo ".load extensions/matmul"
+
     # 00_schema.sql: Configures PRAGMAs, MEMORY layouts, and initializes clustered temp tracking
     cat sql/00_schema.sql
 
@@ -100,7 +102,7 @@ build_sql_script() {
     echo "COMMIT;"
 }
 
-# Add SQLite math extension load if needed, but modern SQLite has math functions built-in
+# Extra arguments natively appended to sqlite bin call
 SQLITE_EXTRA_ARGS=""
 
 # Main Generation Pipeline Iteration
